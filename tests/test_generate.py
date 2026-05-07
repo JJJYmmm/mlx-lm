@@ -17,6 +17,7 @@ from mlx_lm.generate import (
 )
 from mlx_lm.models.cache import KVCache, RotatingKVCache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.speculative import SpeculativeSampler
 from mlx_lm.utils import load
 
 
@@ -115,6 +116,15 @@ class TestGenerate(unittest.TestCase):
         # first 2 generations should be drafts, the third should come
         # from the target model, and last two should be drafts
         self.assertEqual(drafted, [True, True, False, True, True])
+
+    def test_speculative_sampler_accept_logprobs_use_filtered_distribution(self):
+        sampler = SpeculativeSampler(temp=0.6, top_k=1)
+        logits = mx.array([[0.0, 10.0, 9.0]])
+        sample = sampler.sample(logits)
+        self.assertEqual(sample.token.item(), 1)
+        self.assertTrue(mx.isinf(sample.accept_logprobs[0]).item())
+        self.assertTrue(mx.isinf(sample.accept_logprobs[2]).item())
+        self.assertFalse(mx.isinf(sample.accept_logprobs[1]).item())
 
     def test_stream_generate_input_embeddings(self):
         sampler = make_sampler(temp=0.0)  # determinate sampler

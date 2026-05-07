@@ -8,7 +8,7 @@ import json
 import sys
 import time
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from typing import (
     Any,
@@ -39,6 +39,13 @@ from .models.cache import (
     load_prompt_cache,
 )
 from .sample_utils import make_sampler
+from .speculative import (
+    HybridMTPPolicy,
+    NativeMTPProposer,
+    SpeculativeSampler,
+    SpeculativeStats,
+    speculative_generate_loop,
+)
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
 
@@ -219,6 +226,11 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    parser.add_argument(
+        "--native-mtp",
+        action="store_true",
+        help="Use native MTP layers for speculative decoding when available.",
+    )
     return parser
 
 
@@ -294,6 +306,12 @@ class GenerationResponse:
     generation_tps: float
     peak_memory: float
     finish_reason: Optional[str] = None
+    draft_tokens: int = 0
+    accepted_draft_tokens: int = 0
+    draft_accept_rate: float = 0.0
+    draft_position_counts: List[int] = field(default_factory=list)
+    accepted_draft_position_counts: List[int] = field(default_factory=list)
+    draft_position_accept_rates: List[float] = field(default_factory=list)
 
 
 def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_bits):
@@ -477,6 +495,14 @@ def speculative_generate_step(
     *,
     num_draft_tokens: int = 2,
     max_tokens: int = 256,
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: Optional[List[int]] = None,
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prompt_cache: Optional[Any] = None,
@@ -484,6 +510,7 @@ def speculative_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    speculative_stats: Optional[dict] = None,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """
     A generator producing token ids based on the given prompt from the model.
@@ -654,12 +681,110 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+def native_mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    num_draft_tokens: int = 1,
+    max_tokens: int = 256,
+    temp: float = 0.0,
+    top_p: float = 0.0,
+    min_p: float = 0.0,
+    min_tokens_to_keep: int = 1,
+    top_k: int = 0,
+    xtc_probability: float = 0.0,
+    xtc_threshold: float = 0.0,
+    xtc_special_tokens: Optional[List[int]] = None,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = 512,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    prompt_progress_callback: Optional[Callable[[int, int], None]] = None,
+    speculative_stats: Optional[dict] = None,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    if not getattr(model, "has_native_mtp", False):
+        raise ValueError("Native MTP was requested but this model has no MTP layers.")
+    if len(prompt) == 0:
+        raise ValueError("Native MTP requires a non-empty prompt.")
+    if logits_processors:
+        raise ValueError("Native MTP does not yet support logits processors.")
+    if num_draft_tokens < 1:
+        raise ValueError("Native MTP requires at least one draft token.")
+
+    n_layers = len(model.layers)
+    n_mtp_layers = len(model.make_mtp_cache())
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        mtp_cache = model.make_mtp_cache()
+        prompt_cache = model_cache + mtp_cache
+    elif len(prompt_cache) != n_layers + n_mtp_layers:
+        raise ValueError("Native MTP requires a combined target + MTP prompt cache.")
+    else:
+        model_cache = prompt_cache[:n_layers]
+        mtp_cache = prompt_cache[n_layers:]
+
+    prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+    speculative_sampler = SpeculativeSampler(
+        temp=temp,
+        top_p=top_p,
+        min_p=min_p,
+        min_tokens_to_keep=min_tokens_to_keep,
+        top_k=top_k,
+        xtc_probability=xtc_probability,
+        xtc_threshold=xtc_threshold,
+        xtc_special_tokens=xtc_special_tokens,
+    )
+
+    def _target_forward(input_tokens, n_confirmed=0):
+        with mx.stream(generation_stream):
+            logits, hidden = model(
+                input_tokens[None],
+                cache=model_cache,
+                return_hidden=True,
+                n_confirmed=n_confirmed,
+            )
+            quantize_cache_fn(model_cache)
+            return logits, hidden
+
+    _target_forward.stream = generation_stream
+    stats = SpeculativeStats(num_draft_tokens)
+    if speculative_stats is not None:
+        speculative_stats.update(stats.to_dict())
+
+    for token, logprobs, from_draft in speculative_generate_loop(
+        prompt.astype(mx.uint32),
+        _target_forward,
+        NativeMTPProposer(model, mtp_cache, speculative_sampler, generation_stream),
+        HybridMTPPolicy(model_cache, mtp_cache),
+        speculative_sampler,
+        stats,
+        max_tokens=max_tokens,
+        prefill_step_size=prefill_step_size,
+        prompt_cache=prompt_cache,
+        prompt_progress_callback=prompt_progress_callback,
+    ):
+        if speculative_stats is not None:
+            speculative_stats.update(stats.to_dict())
+        yield token, logprobs, from_draft
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     max_tokens: int = 256,
     draft_model: Optional[nn.Module] = None,
+    native_mtp: bool = False,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -698,16 +823,36 @@ def stream_generate(
 
     kwargs["max_tokens"] = max_tokens
 
-    if draft_model is None:
+    speculative_kwargs = (
+        "temp",
+        "top_p",
+        "min_p",
+        "min_tokens_to_keep",
+        "top_k",
+        "xtc_probability",
+        "xtc_threshold",
+        "xtc_special_tokens",
+    )
+    speculative_stats = None
+    if draft_model is None and not native_mtp:
         kwargs.pop("num_draft_tokens", None)
+        for key in speculative_kwargs:
+            kwargs.pop(key, None)
         token_generator = generate_step(prompt, model, **kwargs)
         # from_draft always false for non-speculative generation
         token_generator = (
             (token, logprobs, False) for token, logprobs in token_generator
         )
+    elif draft_model is None:
+        kwargs.pop("max_kv_size", None)
+        speculative_stats = {}
+        kwargs["speculative_stats"] = speculative_stats
+        token_generator = native_mtp_generate_step(prompt, model, **kwargs)
     else:
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
+        for key in speculative_kwargs:
+            kwargs.pop(key, None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
@@ -736,6 +881,34 @@ def stream_generate(
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.get_peak_memory() / 1e9,
                 finish_reason=None,
+                draft_tokens=(
+                    0 if speculative_stats is None else speculative_stats["draft_tokens"]
+                ),
+                accepted_draft_tokens=(
+                    0
+                    if speculative_stats is None
+                    else speculative_stats["accepted_draft_tokens"]
+                ),
+                draft_accept_rate=(
+                    0.0
+                    if speculative_stats is None
+                    else speculative_stats["draft_accept_rate"]
+                ),
+                draft_position_counts=(
+                    []
+                    if speculative_stats is None
+                    else speculative_stats["draft_position_counts"]
+                ),
+                accepted_draft_position_counts=(
+                    []
+                    if speculative_stats is None
+                    else speculative_stats["accepted_draft_position_counts"]
+                ),
+                draft_position_accept_rates=(
+                    []
+                    if speculative_stats is None
+                    else speculative_stats["draft_position_accept_rates"]
+                ),
             )
 
         detokenizer.finalize()
@@ -750,6 +923,34 @@ def stream_generate(
             generation_tps=(n + 1) / (time.perf_counter() - tic),
             peak_memory=mx.get_peak_memory() / 1e9,
             finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
+            draft_tokens=(
+                0 if speculative_stats is None else speculative_stats["draft_tokens"]
+            ),
+            accepted_draft_tokens=(
+                0
+                if speculative_stats is None
+                else speculative_stats["accepted_draft_tokens"]
+            ),
+            draft_accept_rate=(
+                0.0
+                if speculative_stats is None
+                else speculative_stats["draft_accept_rate"]
+            ),
+            draft_position_counts=(
+                []
+                if speculative_stats is None
+                else speculative_stats["draft_position_counts"]
+            ),
+            accepted_draft_position_counts=(
+                []
+                if speculative_stats is None
+                else speculative_stats["accepted_draft_position_counts"]
+            ),
+            draft_position_accept_rates=(
+                []
+                if speculative_stats is None
+                else speculative_stats["draft_position_accept_rates"]
+            ),
         )
 
 
@@ -795,6 +996,17 @@ def generate(
             f"Generation: {response.generation_tokens} tokens, "
             f"{response.generation_tps:.3f} tokens-per-sec"
         )
+        if response.draft_tokens > 0:
+            print(
+                f"Draft accepted: {response.accepted_draft_tokens}/"
+                f"{response.draft_tokens} "
+                f"({100 * response.draft_accept_rate:.1f}%)"
+            )
+            rates = ", ".join(
+                f"{i + 1}:{100 * r:.1f}%"
+                for i, r in enumerate(response.draft_position_accept_rates)
+            )
+            print(f"Draft accept by position: {rates}")
         print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
 
@@ -2076,12 +2288,21 @@ def main():
         max_tokens=args.max_tokens,
         verbose=args.verbose,
         sampler=sampler,
+        temp=args.temp,
+        top_p=args.top_p,
+        min_p=args.min_p,
+        min_tokens_to_keep=args.min_tokens_to_keep,
+        top_k=args.top_k,
+        xtc_probability=args.xtc_probability,
+        xtc_threshold=args.xtc_threshold,
+        xtc_special_tokens=tokenizer.encode("\n") + list(tokenizer.eos_token_ids),
         max_kv_size=args.max_kv_size,
         prompt_cache=prompt_cache if using_cache else None,
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
+        native_mtp=args.native_mtp,
         num_draft_tokens=args.num_draft_tokens,
     )
     if not args.verbose:

@@ -43,6 +43,12 @@ from .models.cache import (
     make_prompt_cache,
 )
 from .sample_utils import make_logits_processors, make_sampler
+from .speculative import (
+    EXTERNAL_DRAFT_CACHE_FAMILY,
+    NATIVE_MTP_CACHE_FAMILY,
+    speculative_cache_family,
+    speculative_prompt_cache_key,
+)
 from .utils import _parse_size, load, sharded_load
 
 
@@ -188,6 +194,7 @@ class GenerationArguments:
 
     max_tokens: int
     num_draft_tokens: int
+    native_mtp: bool
     logprobs: bool
     top_logprobs: int
     seed: Optional[int]
@@ -683,7 +690,11 @@ class ResponseGenerator:
         return sm, sequences
 
     def _is_batchable(self, args):
-        return self.model_provider.is_batchable and args.seed is None
+        return (
+            self.model_provider.is_batchable
+            and args.seed is None
+            and not args.native_mtp  # TODO: support batching with native MTP
+        )
 
     def _generate(self):
         # Local thread stream that we 'll pass to the BatchGenerator to make
@@ -962,15 +973,25 @@ class ResponseGenerator:
 
             # Load the KV cache
             self._log_cache_stats()
+            cache_family = speculative_cache_family(
+                draft_model=draft_model, native_mtp=args.native_mtp
+            )
+            prompt_cache_key = speculative_prompt_cache_key(
+                self.model_provider.model_key, cache_family
+            )
             cache, rest = self.prompt_cache.fetch_nearest_cache(
-                self.model_provider.model_key, prompt
+                prompt_cache_key, prompt
             )
             ctx.prompt_cache_count = len(prompt) - len(rest)
             cache_key = prompt[:]
             if cache is None:
                 cache = make_prompt_cache(self.model_provider.model)
-                if self.model_provider.draft_model is not None:
+                if cache_family == EXTERNAL_DRAFT_CACHE_FAMILY:
                     cache += make_prompt_cache(self.model_provider.draft_model)
+                elif cache_family == NATIVE_MTP_CACHE_FAMILY and getattr(
+                    self.model_provider.model, "has_native_mtp", False
+                ):
+                    cache += self.model_provider.model.make_mtp_cache()
 
             # Process the prompt and generate tokens
             for gen in stream_generate(
@@ -979,9 +1000,20 @@ class ResponseGenerator:
                 prompt=rest,
                 max_tokens=args.max_tokens,
                 sampler=sampler,
+                temp=args.sampling.temperature,
+                top_p=args.sampling.top_p,
+                min_p=args.sampling.min_p,
+                top_k=args.sampling.top_k,
+                xtc_probability=args.sampling.xtc_probability,
+                xtc_threshold=args.sampling.xtc_threshold,
+                xtc_special_tokens=[
+                    tokenizer.eos_token_id,
+                    tokenizer.encode("\n"),
+                ],
                 logits_processors=logits_processors,
                 prompt_cache=cache,
                 draft_model=draft_model,
+                native_mtp=args.native_mtp,
                 num_draft_tokens=args.num_draft_tokens,
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
@@ -1017,7 +1049,7 @@ class ResponseGenerator:
 
             # Save the KV cache again
             self.prompt_cache.insert_cache(
-                self.model_provider.model_key, cache_key, cache
+                prompt_cache_key, cache_key, cache
             )
 
         except Exception as e:
@@ -1165,6 +1197,9 @@ class APIHandler(BaseHTTPRequestHandler):
         self.num_draft_tokens = self.body.get(
             "num_draft_tokens", self.response_generator.cli_args.num_draft_tokens
         )
+        self.native_mtp = self.body.get(
+            "native_mtp", self.response_generator.cli_args.native_mtp
+        )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
@@ -1235,6 +1270,7 @@ class APIHandler(BaseHTTPRequestHandler):
         self._validate("top_k", int, min_val=0)
         self._validate("min_p", (float, int), min_val=0, max_val=1)
         self._validate("num_draft_tokens", int, min_val=0)
+        self._validate("native_mtp", bool)
         self._validate("repetition_penalty", (float, int), min_val=0)
         self._validate("repetition_context_size", int, min_val=0)
         self._validate("presence_penalty", (float, int))
@@ -1399,6 +1435,7 @@ class APIHandler(BaseHTTPRequestHandler):
             stop_words=stop_words,
             max_tokens=self.max_tokens,
             num_draft_tokens=self.num_draft_tokens,
+            native_mtp=self.native_mtp,
             logprobs=self.logprobs,
             top_logprobs=self.top_logprobs,
             seed=self.seed,
@@ -1789,6 +1826,11 @@ def main():
         type=int,
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
+    )
+    parser.add_argument(
+        "--native-mtp",
+        action="store_true",
+        help="Use native MTP layers for speculative decoding when available.",
     )
     parser.add_argument(
         "--trust-remote-code",

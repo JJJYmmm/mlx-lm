@@ -9,7 +9,7 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import ArraysCache, KVCache, RotatingKVCache, make_prompt_cache
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -637,6 +637,9 @@ class TestModels(unittest.TestCase):
                 {
                     hf_norm_key: base,
                     hf_mtp_key: mx.zeros((1,), dtype=mx.float32),
+                    "model.language_model.layers.0.linear_attn.conv1d.weight": mx.zeros(
+                        (12, 1, 4), dtype=mx.float32
+                    ),
                 }
             )
             self.assertIn(mlx_norm_key, converted)
@@ -648,6 +651,76 @@ class TestModels(unittest.TestCase):
             self.assertTrue(
                 mx.array_equal(loaded[mlx_norm_key], converted[mlx_norm_key])
             )
+
+    def test_qwen3_5_native_mtp_module_and_cache(self):
+        from mlx_lm.models import qwen3_5
+
+        args = qwen3_5.ModelArgs.from_dict(
+            {
+                "model_type": "qwen3_5",
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "hidden_size": 16,
+                    "intermediate_size": 32,
+                    "num_hidden_layers": 2,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 1,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 32,
+                    "linear_num_value_heads": 1,
+                    "linear_num_key_heads": 1,
+                    "linear_key_head_dim": 8,
+                    "linear_value_head_dim": 8,
+                    "linear_conv_kernel_dim": 1,
+                    "full_attention_interval": 2,
+                    "tie_word_embeddings": True,
+                    "max_position_embeddings": 64,
+                    "head_dim": 8,
+                    "mtp_num_hidden_layers": 1,
+                },
+            }
+        )
+        model = qwen3_5.Model(args)
+        self.assertTrue(model.has_native_mtp)
+        self.assertEqual(
+            type(model.language_model.mtp).__module__.split(".")[-1],
+            "qwen3_5_mtp",
+        )
+
+        tokens = mx.array([[1, 2]], dtype=mx.uint32)
+        cache = model.make_cache()
+        logits, hidden = model(tokens, cache=cache, return_hidden=True)
+        self.assertEqual(logits.shape, (1, 2, 32))
+        self.assertEqual(hidden.shape, (1, 2, 16))
+
+        mtp_cache = model.make_mtp_cache()
+        mtp_logits = model.mtp_forward(hidden, tokens, mtp_cache)
+        self.assertEqual(mtp_logits.shape, (1, 2, 32))
+        self.assertEqual(mtp_cache[0].offset, 2)
+
+    def test_qwen3_5_gated_delta_sets_rollback_state(self):
+        from mlx_lm.models import qwen3_5
+
+        args = qwen3_5.TextModelArgs(
+            model_type="qwen3_5_text",
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            vocab_size=32,
+            linear_num_value_heads=1,
+            linear_num_key_heads=1,
+            linear_key_head_dim=4,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=1,
+        )
+        layer = qwen3_5.GatedDeltaNet(args)
+        cache = ArraysCache(size=2)
+        x = mx.ones((1, 2, 8), dtype=mx.float32)
+        y = layer(x, cache=cache, n_confirmed=1)
+        mx.eval(y)
+        self.assertIsNotNone(cache.rollback_state)
 
     def test_gemma4_convert_then_load_keeps_language_model_prefix(self):
         from mlx_lm.models import gemma4

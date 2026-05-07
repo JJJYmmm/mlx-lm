@@ -18,6 +18,13 @@ from mlx_lm.server import (
     ResponseGenerator,
     _process_control_tokens,
 )
+from mlx_lm.speculative import (
+    EXTERNAL_DRAFT_CACHE_FAMILY,
+    NATIVE_MTP_CACHE_FAMILY,
+    TARGET_CACHE_FAMILY,
+    speculative_cache_family,
+    speculative_prompt_cache_key,
+)
 from mlx_lm.utils import load
 
 
@@ -41,6 +48,7 @@ class DummyModelProvider:
                 "trust_remote_code": False,
                 "draft_model": None,
                 "num_draft_tokens": 3,
+                "native_mtp": False,
                 "temp": 0.0,
                 "top_p": 1.0,
                 "top_k": 0,
@@ -518,6 +526,23 @@ class TestKeepalive(unittest.TestCase):
 
 
 class TestLRUPromptCache(unittest.TestCase):
+    def test_speculative_cache_keys_are_distinct(self):
+        model_key = ("model", None, None)
+        target_family = speculative_cache_family()
+        native_family = speculative_cache_family(native_mtp=True)
+        draft_family = speculative_cache_family(draft_model=object(), native_mtp=True)
+        self.assertEqual(target_family, TARGET_CACHE_FAMILY)
+        self.assertEqual(native_family, NATIVE_MTP_CACHE_FAMILY)
+        self.assertEqual(draft_family, EXTERNAL_DRAFT_CACHE_FAMILY)
+        self.assertNotEqual(
+            speculative_prompt_cache_key(model_key, target_family),
+            speculative_prompt_cache_key(model_key, native_family),
+        )
+        self.assertNotEqual(
+            speculative_prompt_cache_key(model_key, native_family),
+            speculative_prompt_cache_key(model_key, draft_family),
+        )
+
     def test_caching(self):
         cache = LRUPromptCache(max_size=10)
 

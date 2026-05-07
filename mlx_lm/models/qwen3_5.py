@@ -15,6 +15,7 @@ from .base import (
 )
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_update
+from .qwen3_5_mtp import Model as MTPDraftModel
 from .qwen3_next import Qwen3NextAttention as Attention
 from .qwen3_next import Qwen3NextMLP as MLP
 from .qwen3_next import Qwen3NextRMSNormGated as RMSNormGated
@@ -41,6 +42,7 @@ class TextModelArgs(BaseModelArgs):
     attention_bias: bool = False
     head_dim: Optional[int] = None
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 0
 
     # MoE fields (optional, for Qwen3_5MoeForConditionalGeneration)
     num_experts: int = 0
@@ -129,11 +131,63 @@ class GatedDeltaNet(nn.Module):
 
         self.sharding_group = None
 
+    def _process_chunk(
+        self,
+        qkv: mx.array,
+        a: mx.array,
+        b: mx.array,
+        conv_state: mx.array,
+        ssm_state: Optional[mx.array],
+        mask: Optional[mx.array] = None,
+        lengths: Optional[mx.array] = None,
+    ):
+        B, S, _ = qkv.shape
+        conv_input = mx.concatenate([conv_state, qkv], axis=1)
+        n_keep = self.conv_kernel_size - 1
+        if n_keep == 0:
+            conv_next = mx.zeros((B, 0, self.conv_dim), dtype=qkv.dtype)
+        elif lengths is not None:
+            ends = mx.clip(lengths, 0, S)
+            positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+            conv_next = mx.take_along_axis(conv_input, positions, axis=1)
+        else:
+            conv_next = mx.contiguous(conv_input[:, -n_keep:, :])
+        conv_out = nn.silu(self.conv1d(conv_input))
+
+        q, k, v = [
+            t.reshape(B, S, h, d)
+            for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+            )
+        ]
+
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        out, ssm_next = gated_delta_update(
+            q,
+            k,
+            v,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            mask,
+            use_kernel=not self.training,
+        )
+
+        return out, conv_next, ssm_next
+
     def __call__(
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -152,48 +206,46 @@ class GatedDeltaNet(nn.Module):
                 (B, self.conv_kernel_size - 1, self.conv_dim),
                 dtype=inputs.dtype,
             )
+        state = cache[1] if cache else None
 
         if mask is not None:
             qkv = mx.where(mask[..., None], qkv, 0)
-        conv_input = mx.concatenate([conv_state, qkv], axis=1)
-        if cache is not None:
-            n_keep = self.conv_kernel_size - 1
-            if cache.lengths is not None:
-                ends = mx.clip(cache.lengths, 0, S)
-                positions = (ends[:, None] + mx.arange(n_keep))[..., None]
-                cache[0] = mx.take_along_axis(conv_input, positions, axis=1)
-            else:
-                cache[0] = mx.contiguous(conv_input[:, -n_keep:, :])
-        conv_out = nn.silu(self.conv1d(conv_input))
 
-        q, k, v = [
-            t.reshape(B, S, h, d)
-            for t, h, d in zip(
-                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
-                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
-                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+        if 0 < n_confirmed < S:
+            # Native MTP verify can feed confirmed tokens followed by speculative
+            # draft tokens in one linear-attention call. The recurrent state after
+            # the confirmed prefix is the rollback point if a later draft rejects.
+            mask_confirmed = mask[:, :n_confirmed] if mask is not None else None
+            mask_draft = mask[:, n_confirmed:] if mask is not None else None
+            out_confirmed, conv_checkpoint, state_checkpoint = self._process_chunk(
+                qkv[:, :n_confirmed],
+                a[:, :n_confirmed],
+                b[:, :n_confirmed],
+                conv_state,
+                state,
+                mask_confirmed,
             )
-        ]
-
-        state = cache[1] if cache else None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+            if cache is not None:
+                cache.rollback_state = (conv_checkpoint, state_checkpoint)
+            # Continue from the checkpoint so accept keeps the full sequence state,
+            # while reject can restore exactly to the confirmed-prefix state.
+            out_draft, conv_state, state = self._process_chunk(
+                qkv[:, n_confirmed:],
+                a[:, n_confirmed:],
+                b[:, n_confirmed:],
+                conv_checkpoint,
+                state_checkpoint,
+                mask_draft,
+            )
+            out = mx.concatenate([out_confirmed, out_draft], axis=1)
+        else:
+            lengths = cache.lengths if cache is not None else None
+            out, conv_state, state = self._process_chunk(
+                qkv, a, b, conv_state, state, mask, lengths=lengths
+            )
 
         if cache is not None:
+            cache[0] = conv_state
             cache[1] = state
             cache.advance(S)
 
@@ -230,9 +282,12 @@ class DecoderLayer(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache)
         h = x + r
@@ -256,6 +311,7 @@ class Qwen3_5TextModel(nn.Module):
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if input_embeddings is not None:
             hidden_states = input_embeddings
@@ -265,14 +321,18 @@ class Qwen3_5TextModel(nn.Module):
         if cache is None:
             cache = [None] * len(self.layers)
 
-        fa_mask = create_attention_mask(hidden_states, cache[self.fa_idx])
+        fa_mask = create_attention_mask(
+            hidden_states, cache[self.fa_idx], return_array=n_confirmed > 0
+        )
         ssm_mask = create_ssm_mask(hidden_states, cache[self.ssm_idx])
 
         for layer, c in zip(self.layers, cache):
             mask = ssm_mask if layer.is_linear else fa_mask
-            hidden_states = layer(hidden_states, mask=mask, cache=c)
+            hidden_states = layer(
+                hidden_states, mask=mask, cache=c, n_confirmed=n_confirmed
+            )
 
-        return self.norm(hidden_states)
+        return hidden_states
 
 
 class TextModel(nn.Module):
@@ -283,18 +343,30 @@ class TextModel(nn.Module):
         self.model = Qwen3_5TextModel(args)
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if args.mtp_num_hidden_layers > 0:
+            self.mtp = MTPDraftModel(args)
 
     def __call__(
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ) -> mx.array:
-        out = self.model(inputs, cache, input_embeddings=input_embeddings)
+        hidden = self.model(
+            inputs,
+            cache,
+            input_embeddings=input_embeddings,
+            n_confirmed=n_confirmed,
+        )
+        out = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:
             out = self.lm_head(out)
+        if return_hidden:
+            return out, hidden
         return out
 
     @property
@@ -304,13 +376,36 @@ class TextModel(nn.Module):
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
 
+    @property
+    def has_native_mtp(self):
+        return hasattr(self, "mtp")
+
+    def make_mtp_cache(self):
+        if not self.has_native_mtp:
+            return []
+        return self.mtp.make_cache()
+
+    def mtp_forward(
+        self, hidden_states, next_token_ids, mtp_cache, return_hidden=False
+    ):
+        if not self.has_native_mtp:
+            raise ValueError("This model does not have native MTP layers.")
+        return self.mtp(
+            hidden_states,
+            next_token_ids,
+            self.model.embed_tokens,
+            None if self.args.tie_word_embeddings else self.lm_head,
+            mtp_cache,
+            return_hidden=return_hidden,
+        )
+
     def sanitize(self, weights):
-        has_mtp_weights = any("mtp." in k for k in weights)
         has_unsanitized_conv1d = any(
             "conv1d.weight" in k and v.shape[-1] != 1 for k, v in weights.items()
         )
-        should_shift_norm_weights = has_mtp_weights or has_unsanitized_conv1d
-        weights = {k: v for k, v in weights.items() if "mtp." not in k}
+        should_shift_norm_weights = has_unsanitized_conv1d
+        if not self.has_native_mtp:
+            weights = {k: v for k, v in weights.items() if "mtp." not in k}
 
         if self.args.tie_word_embeddings:
             weights.pop("lm_head.weight", None)
@@ -321,6 +416,9 @@ class TextModel(nn.Module):
             "model.norm.weight",
             ".q_norm.weight",
             ".k_norm.weight",
+            ".pre_fc_norm_hidden.weight",
+            ".pre_fc_norm_embedding.weight",
+            "mtp.norm.weight",
         )
         for k, v in weights.items():
             if "conv1d.weight" in k and v.shape[-1] != 1:
@@ -376,9 +474,29 @@ class Model(nn.Module):
         inputs: mx.array,
         cache=None,
         input_embeddings: Optional[mx.array] = None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
     ):
         return self.language_model(
-            inputs, cache=cache, input_embeddings=input_embeddings
+            inputs,
+            cache=cache,
+            input_embeddings=input_embeddings,
+            return_hidden=return_hidden,
+            n_confirmed=n_confirmed,
+        )
+
+    @property
+    def has_native_mtp(self):
+        return self.language_model.has_native_mtp
+
+    def make_mtp_cache(self):
+        return self.language_model.make_mtp_cache()
+
+    def mtp_forward(
+        self, hidden_states, next_token_ids, mtp_cache, return_hidden=False
+    ):
+        return self.language_model.mtp_forward(
+            hidden_states, next_token_ids, mtp_cache, return_hidden=return_hidden
         )
 
     def sanitize(self, weights):
